@@ -1,0 +1,164 @@
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from typing import Protocol, Dict, Any
+import json
+
+
+# ---------- Contracts & Data Models ----------
+
+class LLM(Protocol):
+    async def __call__(self, prompt: str) -> str:
+        ...
+
+
+@dataclass
+class RefundARQ:
+    current_context: str
+    active_guideline: str
+    action_taken_before: bool
+    requires_tool: bool
+    next_step: str  # e.g. "Run check_order_status()" or "reply_to_user"
+
+    @staticmethod
+    def from_json(raw: str) -> "RefundARQ":
+        data = json.loads(raw)
+        return RefundARQ(
+            current_context=data["current_context"],
+            active_guideline=data["active_guideline"],
+            action_taken_before=bool(data["action_taken_before"]),
+            requires_tool=bool(data["requires_tool"]),
+            next_step=data["next_step"],
+        )
+
+    def to_pretty_json(self) -> str:
+        return json.dumps(asdict(self), indent=2)
+
+
+# ---------- Prompt Builders (ARQ phase + final answer) ----------
+
+def build_refund_arq_prompt(user_message: str) -> str:
+    return f"""
+You are a customer support agent.
+Before answering, you MUST fill out the following JSON object that captures your reasoning.
+Only output valid JSON, no extra text.
+
+User message:
+\"\"\"{user_message}\"\"\"
+
+Fill this JSON strictly:
+
+{{
+  "current_context": "<short description of what the user is asking>",
+  "active_guideline": "<which policy or rule is most relevant right now>",
+  "action_taken_before": <true|false – have we already performed the required check in this conversation?>,
+  "requires_tool": <true|false – do we need to call an external tool (e.g., check_order_status) before replying?>,
+  "next_step": "<either a tool to call or 'reply_to_user'>"
+}}
+"""  
+
+def build_final_prompt_with_tool(arq: RefundARQ, tool_result: Dict[str, Any]) -> str:
+    return f"""
+You are a customer support agent.
+
+Here is your prior reasoning (ARQ):
+{arq.to_pretty_json()}
+
+Here is the result of the required tool call:
+{json.dumps(tool_result, indent=2)}
+
+Now write a final response to the user that strictly follows:
+- The active guideline from the ARQ
+- The factual data from the tool
+- A polite, professional tone
+"""
+
+
+def build_final_prompt_without_tool(arq: RefundARQ) -> str:
+    return f"""
+You are a customer support agent.
+
+Here is your prior reasoning (ARQ):
+{arq.to_pretty_json()}
+
+Now write a final response to the user that strictly follows:
+- The active guideline from the ARQ
+- A polite, professional tone
+"""
+
+
+# ---------- Tool Layer (example) ----------
+
+async def check_order_status_from_db(user_message: str) -> Dict[str, Any]:
+    # In production, parse order_id from user_message and query your DB/API.
+    return {
+        "order_id": "12345",
+        "eligible_for_refund": True,
+        "status": "Delivered",
+        "days_since_delivery": 10,
+    }
+
+
+# ---------- Orchestrator (single entrypoint) ----------
+
+async def handle_refund_request(user_message: str, llm: LLM) -> Dict[str, Any]:
+    """
+    High-level ARQ pipeline for a refund request:
+    1) Ask LLM to fill the RefundARQ JSON.
+    2) Optionally run tools based on ARQ.
+    3) Ask LLM for a final user-facing answer, grounded in ARQ (+ tool output).
+    """
+    # 1) ARQ reasoning phase
+    arq_prompt = build_refund_arq_prompt(user_message)
+    arq_raw = await llm(arq_prompt)
+    arq = RefundARQ.from_json(arq_raw)
+
+    result: Dict[str, Any] = {"arq": asdict(arq)}
+
+    # 2) Tool branching based on ARQ
+    tool_result: Dict[str, Any] | None = None
+    if arq.requires_tool and arq.next_step == "Run check_order_status()":
+        tool_result = await check_order_status_from_db(user_message)
+        result["tool_result"] = tool_result
+        final_prompt = build_final_prompt_with_tool(arq, tool_result)
+    else:
+        final_prompt = build_final_prompt_without_tool(arq)
+
+    # 3) Final answer phase
+    final_answer = await llm(final_prompt)
+    result["final_answer"] = final_answer
+    return result
+
+
+# ---------- Example mock LLM (for local testing) ----------
+
+class MockLLM:
+    async def __call__(self, prompt: str) -> str:
+        # Extremely simplified: if we detect ARQ phase, return a fixed JSON.
+        if "\"current_context\"" in prompt and "\"active_guideline\"" in prompt:
+            mock = {
+                "current_context": "Customer asking if their order is eligible for a refund",
+                "active_guideline": "Always verify order status before issuing refund",
+                "action_taken_before": False,
+                "requires_tool": True,
+                "next_step": "Run check_order_status()",
+            }
+            return json.dumps(mock)
+        # Otherwise treat it as final-answer phase.
+        return "Thanks for reaching out! I have checked your order and you are eligible for a refund. Here’s what will happen next: ..."
+
+
+# ---------- Manual test ----------
+
+if __name__ == "__main__":
+    import asyncio
+
+    async def demo():
+        user_msg = "Hi, can I get a refund for my last order?"
+        llm = MockLLM()
+        result = await handle_refund_request(user_msg, llm)
+        print("ARQ:", json.dumps(result["arq"], indent=2))
+        if "tool_result" in result:
+            print("Tool result:", json.dumps(result["tool_result"], indent=2))
+        print("Final answer:", result["final_answer"])
+
+    asyncio.run(demo())
